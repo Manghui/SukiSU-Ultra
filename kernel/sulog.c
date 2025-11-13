@@ -12,362 +12,319 @@
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
-#include <linux/crc32.h>
+#include <linux/kfifo.h>
 
 #include "klog.h"
 #include "sulog.h"
 #include "ksu.h"
 
 #if __SULOG_GATE
+
+#define SULOG_FIFO_SIZE (64 * sizeof(struct sulog_entry *))
+
 struct dedup_entry dedup_tbl[SULOG_COMM_LEN];
 DEFINE_SPINLOCK(dedup_lock);
-static LIST_HEAD(sulog_queue);
-static DEFINE_MUTEX(sulog_mutex);
+
+static DECLARE_KFIFO(sulog_fifo, struct sulog_entry *, 64);
+static DEFINE_SPINLOCK(fifo_lock);
 static struct workqueue_struct *sulog_workqueue;
 static struct work_struct sulog_work;
 static bool sulog_enabled = true;
+static atomic_t pending_work = ATOMIC_INIT(0);
 
 static void get_timestamp(char *buf, size_t len)
 {
     struct timespec64 ts;
     struct tm tm;
+    time64_t local_time;
 
     ktime_get_real_ts64(&ts);
+    local_time = ts.tv_sec - (sys_tz.tz_minuteswest * 60);
+    time64_to_tm(local_time, 0, &tm);
 
-    time64_to_tm(ts.tv_sec - sys_tz.tz_minuteswest * 60, 0, &tm);
-
-    snprintf(buf, len,
-         "%04ld-%02d-%02d %02d:%02d:%02d",
-         tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-         tm.tm_hour, tm.tm_min, tm.tm_sec);
+    snprintf(buf, len, "%04ld-%02d-%02d %02d:%02d:%02d",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
 static void ksu_get_cmdline(char *full_comm, const char *comm, size_t buf_len)
 {
     char *kbuf;
+    int n;
 
     if (!full_comm || buf_len <= 0)
         return;
 
     if (comm && strlen(comm) > 0) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
-        strscpy(full_comm, comm, buf_len);
-#else
-        strlcpy(full_comm, comm, buf_len);
-#endif
-    } else {
-        kbuf = kmalloc(buf_len, GFP_ATOMIC);
-        if (!kbuf) {
-            pr_err("sulog: failed to allocate memory for kbuf\n");
-            return;
-        }
-
-        int n = get_cmdline(current, kbuf, buf_len);
-
-        if (n <= 0) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
-            strscpy(full_comm, current->comm, buf_len);
-#else
-            strlcpy(full_comm, current->comm, buf_len);
-#endif
-        } else {
-            for (int i = 0; i < n; i++) {
-                if (kbuf[i] == '\0') kbuf[i] = ' ';
-            }
-            kbuf[n < buf_len ? n : buf_len - 1] = '\0';
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
-            strscpy(full_comm, kbuf, buf_len);
-#else
-            strlcpy(full_comm, kbuf, buf_len);
-#endif
-        }
-
-        kfree(kbuf);
+        ksu_strlcpy(full_comm, comm, buf_len);
+        return;
     }
+
+    kbuf = kmalloc(buf_len, GFP_ATOMIC);
+    if (!kbuf) {
+        pr_err("sulog: failed to allocate memory for kbuf\n");
+        return;
+    }
+
+    n = get_cmdline(current, kbuf, buf_len);
+    if (n <= 0) {
+        ksu_strlcpy(full_comm, current->comm, buf_len);
+    } else {
+        for (int i = 0; i < n; i++) {
+            if (kbuf[i] == '\0')
+                kbuf[i] = ' ';
+        }
+        kbuf[n < buf_len ? n : buf_len - 1] = '\0';
+        ksu_strlcpy(full_comm, kbuf, buf_len);
+    }
+
+    kfree(kbuf);
 }
 
-static bool dedup_should_print(uid_t uid, u8 type,
-                               const char *content, size_t len)
+static bool dedup_should_print(uid_t uid, u8 type, const char *content, size_t len)
 {
     struct dedup_key key = {
-        .crc  = dedup_calc_hash(content, len),
-        .uid  = uid,
+        .crc = dedup_calc_hash(content, len),
+        .uid = uid,
         .type = type,
     };
     u64 now = ktime_get_ns();
     u64 delta_ns = DEDUP_SECS * NSEC_PER_SEC;
-
     u32 idx = key.crc & (SULOG_COMM_LEN - 1);
+    struct dedup_entry *e;
+    bool should_print;
+
     spin_lock(&dedup_lock);
-
-    struct dedup_entry *e = &dedup_tbl[idx];
-    if (e->key.crc == key.crc &&
-        e->key.uid == key.uid &&
-        e->key.type == key.type &&
-        (now - e->ts_ns) < delta_ns) {
-        spin_unlock(&dedup_lock);
-        return false;
+    e = &dedup_tbl[idx];
+    should_print = !(e->key.crc == key.crc && e->key.uid == key.uid &&
+                     e->key.type == key.type && (now - e->ts_ns) < delta_ns);
+    if (should_print) {
+        e->key = key;
+        e->ts_ns = now;
     }
-
-    e->key = key;
-    e->ts_ns = now;
     spin_unlock(&dedup_lock);
-    return true;
+
+    return should_print;
 }
 
 static void sulog_work_handler(struct work_struct *work)
 {
     struct file *fp;
-    struct sulog_entry *entry, *tmp;
-    LIST_HEAD(local_queue);
+    struct sulog_entry *entry;
     loff_t pos = 0;
-    
-    mutex_lock(&sulog_mutex);
-    list_splice_init(&sulog_queue, &local_queue);
-    mutex_unlock(&sulog_mutex);
-    
-    if (list_empty(&local_queue))
-        return;
-    
+    unsigned int entries_processed = 0;
+    unsigned long flags;
+
     fp = filp_open(SULOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0640);
     if (IS_ERR(fp)) {
         pr_err("sulog: failed to open log file: %ld\n", PTR_ERR(fp));
-        goto cleanup;
+        goto clear_pending;
     }
-    
+
     if (fp->f_inode->i_size > SULOG_MAX_SIZE) {
         pr_info("sulog: log file exceeds maximum size, clearing...\n");
-        if (vfs_truncate(&fp->f_path, 0)) {
+        if (vfs_truncate(&fp->f_path, 0))
             pr_err("sulog: failed to truncate log file\n");
-        }
         pos = 0;
     } else {
         pos = fp->f_inode->i_size;
     }
-    
-    list_for_each_entry(entry, &local_queue, list) {
-        kernel_write(fp, entry->content, strlen(entry->content), &pos);
+
+    spin_lock_irqsave(&fifo_lock, flags);
+    while (kfifo_out(&sulog_fifo, &entry, 1)) {
+        spin_unlock_irqrestore(&fifo_lock, flags);
+
+        if (entry) {
+            kernel_write(fp, entry->content, strlen(entry->content), &pos);
+            kfree(entry);
+            entries_processed++;
+        }
+
+        spin_lock_irqsave(&fifo_lock, flags);
     }
-    
+    spin_unlock_irqrestore(&fifo_lock, flags);
+
     vfs_fsync(fp, 0);
     filp_close(fp, 0);
-    
-cleanup:
-    list_for_each_entry_safe(entry, tmp, &local_queue, list) {
-        list_del(&entry->list);
-        kfree(entry);
-    }
+
+    if (entries_processed > 0)
+        pr_debug("sulog: wrote %u entries\n", entries_processed);
+
+clear_pending:
+    atomic_set(&pending_work, 0);
 }
 
-static void sulog_add_entry(const char *content)
+static bool sulog_add_entry(struct sulog_entry *entry)
+{
+    unsigned long flags;
+    bool queued;
+    int should_queue;
+
+    if (!sulog_enabled || !entry)
+        return false;
+
+    spin_lock_irqsave(&fifo_lock, flags);
+    queued = kfifo_in(&sulog_fifo, &entry, 1) > 0;
+    should_queue = !atomic_cmpxchg(&pending_work, 0, 1);
+    spin_unlock_irqrestore(&fifo_lock, flags);
+
+    if (queued && should_queue && sulog_workqueue)
+        queue_work(sulog_workqueue, &sulog_work);
+
+    if (!queued) {
+        pr_warn("sulog: fifo full, dropping entry\n");
+        kfree(entry);
+    }
+
+    return queued;
+}
+
+static struct sulog_entry *sulog_alloc_entry(const char *log_buf)
 {
     struct sulog_entry *entry;
-    
-    if (!sulog_enabled || !content)
-        return;
-    
+
     entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
     if (!entry) {
-        pr_err("sulog: failed to allocate memory for log entry\n");
-        return;
+        pr_err("sulog: failed to allocate log entry\n");
+        return NULL;
     }
-    
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
-        strscpy(entry->content, content, SULOG_ENTRY_MAX_LEN - 1);
-#else
-        strlcpy(entry->content, content, SULOG_ENTRY_MAX_LEN - 1);
-#endif
-    
-    mutex_lock(&sulog_mutex);
-    list_add_tail(&entry->list, &sulog_queue);
-    mutex_unlock(&sulog_mutex);
-    
-    if (sulog_workqueue)
-        queue_work(sulog_workqueue, &sulog_work);
+
+    ksu_strlcpy(entry->content, log_buf, SULOG_ENTRY_MAX_LEN - 1);
+
+    return entry;
 }
 
 void ksu_sulog_report_su_grant(uid_t uid, const char *comm, const char *method)
 {
-    char *timestamp, *full_comm, *log_buf;
-    
+    char timestamp[32];
+    char full_comm[SULOG_COMM_LEN];
+    char log_buf[SULOG_ENTRY_MAX_LEN];
+    struct sulog_entry *entry;
+
     if (!sulog_enabled)
         return;
-    
-    timestamp = kmalloc(32, GFP_ATOMIC);
-    full_comm = kmalloc(SULOG_COMM_LEN, GFP_ATOMIC);
-    log_buf = kmalloc(SULOG_ENTRY_MAX_LEN, GFP_ATOMIC);
-    
-    if (!timestamp || !full_comm || !log_buf) {
-        pr_err("sulog: failed to allocate memory for su_grant log\n");
-        goto cleanup;
-    }
-    
-    get_timestamp(timestamp, 32);
-    
-    ksu_get_cmdline(full_comm, comm, SULOG_COMM_LEN);
-    
-    snprintf(log_buf, SULOG_ENTRY_MAX_LEN,
-        "[%s] SU_GRANT: UID=%d COMM=%s METHOD=%s PID=%d\n",
-        timestamp, uid, full_comm, 
-        method ? method : "unknown", current->pid);
+
+    get_timestamp(timestamp, sizeof(timestamp));
+    ksu_get_cmdline(full_comm, comm, sizeof(full_comm));
+
+    snprintf(log_buf, sizeof(log_buf),
+             "[%s] SU_GRANT: UID=%d COMM=%s METHOD=%s PID=%d\n",
+             timestamp, uid, full_comm, method ? method : "unknown",
+             current->pid);
 
     if (!dedup_should_print(uid, DEDUP_SU_GRANT, log_buf, strlen(log_buf)))
-        goto cleanup;
-    
-    sulog_add_entry(log_buf);
-    
-cleanup:
-    if (timestamp) kfree(timestamp);
-    if (full_comm) kfree(full_comm);
-    if (log_buf) kfree(log_buf);
+        return;
+
+    entry = sulog_alloc_entry(log_buf);
+    if (entry)
+        sulog_add_entry(entry);
 }
 
-void ksu_sulog_report_su_attempt(uid_t uid, const char *comm, const char *target_path, bool success)
+void ksu_sulog_report_su_attempt(uid_t uid, const char *comm,
+                                 const char *target_path, bool success)
 {
-    char *timestamp, *full_comm, *log_buf;
-    
+    char timestamp[32];
+    char full_comm[SULOG_COMM_LEN];
+    char log_buf[SULOG_ENTRY_MAX_LEN];
+    struct sulog_entry *entry;
+
     if (!sulog_enabled)
         return;
-    
-    timestamp = kmalloc(32, GFP_ATOMIC);
-    full_comm = kmalloc(SULOG_COMM_LEN, GFP_ATOMIC);
-    log_buf = kmalloc(SULOG_ENTRY_MAX_LEN, GFP_ATOMIC);
-    
-    if (!timestamp || !full_comm || !log_buf) {
-        pr_err("sulog: failed to allocate memory for su_attempt log\n");
-        goto cleanup;
-    }
-    
-    get_timestamp(timestamp, 32);
-    
-    ksu_get_cmdline(full_comm, comm, SULOG_COMM_LEN);
-    
-    snprintf(log_buf, SULOG_ENTRY_MAX_LEN,
-        "[%s] SU_EXEC: UID=%d COMM=%s TARGET=%s RESULT=%s PID=%d\n",
-        timestamp, uid, full_comm,
-        target_path ? target_path : "unknown",
-        success ? "SUCCESS" : "DENIED", current->pid);
+
+    get_timestamp(timestamp, sizeof(timestamp));
+    ksu_get_cmdline(full_comm, comm, sizeof(full_comm));
+
+    snprintf(log_buf, sizeof(log_buf),
+             "[%s] SU_EXEC: UID=%d COMM=%s TARGET=%s RESULT=%s PID=%d\n",
+             timestamp, uid, full_comm, target_path ? target_path : "unknown",
+             success ? "SUCCESS" : "DENIED", current->pid);
 
     if (!dedup_should_print(uid, DEDUP_SU_ATTEMPT, log_buf, strlen(log_buf)))
-        goto cleanup;
-    
-    sulog_add_entry(log_buf);
-    
-cleanup:
-    if (timestamp) kfree(timestamp);
-    if (full_comm) kfree(full_comm);
-    if (log_buf) kfree(log_buf);
+        return;
+
+    entry = sulog_alloc_entry(log_buf);
+    if (entry)
+        sulog_add_entry(entry);
 }
 
 void ksu_sulog_report_permission_check(uid_t uid, const char *comm, bool allowed)
 {
-    char *timestamp, *full_comm, *log_buf;
-    
+    char timestamp[32];
+    char full_comm[SULOG_COMM_LEN];
+    char log_buf[SULOG_ENTRY_MAX_LEN];
+    struct sulog_entry *entry;
+
     if (!sulog_enabled)
         return;
-    
-    timestamp = kmalloc(32, GFP_ATOMIC);
-    full_comm = kmalloc(SULOG_COMM_LEN, GFP_ATOMIC);
-    log_buf = kmalloc(SULOG_ENTRY_MAX_LEN, GFP_ATOMIC);
-    
-    if (!timestamp || !full_comm || !log_buf) {
-        pr_err("sulog: failed to allocate memory for permission_check log\n");
-        goto cleanup;
-    }
-    
-    get_timestamp(timestamp, 32);
-    
-    ksu_get_cmdline(full_comm, comm, SULOG_COMM_LEN);
-    
-    snprintf(log_buf, SULOG_ENTRY_MAX_LEN,
-        "[%s] PERM_CHECK: UID=%d COMM=%s RESULT=%s PID=%d\n",
-        timestamp, uid, full_comm,
-        allowed ? "ALLOWED" : "DENIED", current->pid);
+
+    get_timestamp(timestamp, sizeof(timestamp));
+    ksu_get_cmdline(full_comm, comm, sizeof(full_comm));
+
+    snprintf(log_buf, sizeof(log_buf),
+             "[%s] PERM_CHECK: UID=%d COMM=%s RESULT=%s PID=%d\n",
+             timestamp, uid, full_comm, allowed ? "ALLOWED" : "DENIED",
+             current->pid);
 
     if (!dedup_should_print(uid, DEDUP_PERM_CHECK, log_buf, strlen(log_buf)))
-        goto cleanup;
-    
-    sulog_add_entry(log_buf);
-    
-cleanup:
-    if (timestamp) kfree(timestamp);
-    if (full_comm) kfree(full_comm);
-    if (log_buf) kfree(log_buf);
+        return;
+
+    entry = sulog_alloc_entry(log_buf);
+    if (entry)
+        sulog_add_entry(entry);
 }
 
-void ksu_sulog_report_manager_operation(const char *operation, uid_t manager_uid, uid_t target_uid)
+void ksu_sulog_report_manager_operation(const char *operation, uid_t manager_uid,
+                                        uid_t target_uid)
 {
-    char *timestamp, *full_comm, *log_buf;
-    
+    char timestamp[32];
+    char full_comm[SULOG_COMM_LEN];
+    char log_buf[SULOG_ENTRY_MAX_LEN];
+    struct sulog_entry *entry;
+
     if (!sulog_enabled)
         return;
-    
-    timestamp = kmalloc(32, GFP_ATOMIC);
-    full_comm = kmalloc(SULOG_COMM_LEN, GFP_ATOMIC);
-    log_buf = kmalloc(SULOG_ENTRY_MAX_LEN, GFP_ATOMIC);
-    
-    if (!timestamp || !full_comm || !log_buf) {
-        pr_err("sulog: failed to allocate memory for manager_operation log\n");
-        goto cleanup;
-    }
-    
-    get_timestamp(timestamp, 32);
 
-    ksu_get_cmdline(full_comm, NULL, SULOG_COMM_LEN);
-    
-    snprintf(log_buf, SULOG_ENTRY_MAX_LEN,
-        "[%s] MANAGER_OP: OP=%s MANAGER_UID=%d TARGET_UID=%d COMM=%s PID=%d\n",
-        timestamp, operation ? operation : "unknown",
-        manager_uid, target_uid, full_comm, current->pid);
+    get_timestamp(timestamp, sizeof(timestamp));
+    ksu_get_cmdline(full_comm, NULL, sizeof(full_comm));
+
+    snprintf(log_buf, sizeof(log_buf),
+             "[%s] MANAGER_OP: OP=%s MANAGER_UID=%d TARGET_UID=%d COMM=%s PID=%d\n",
+             timestamp, operation ? operation : "unknown", manager_uid, target_uid,
+             full_comm, current->pid);
 
     if (!dedup_should_print(manager_uid, DEDUP_MANAGER_OP, log_buf, strlen(log_buf)))
-        goto cleanup;
-    
-    sulog_add_entry(log_buf);
-    
-cleanup:
-    if (timestamp) kfree(timestamp);
-    if (full_comm) kfree(full_comm);
-    if (log_buf) kfree(log_buf);
+        return;
+
+    entry = sulog_alloc_entry(log_buf);
+    if (entry)
+        sulog_add_entry(entry);
 }
 
-void ksu_sulog_report_syscall(uid_t uid, const char *comm,
-                  const char *syscall, const char *args)
+void ksu_sulog_report_syscall(uid_t uid, const char *comm, const char *syscall,
+                              const char *args)
 {
-    char *timestamp, *full_comm, *log_buf;
+    char timestamp[32];
+    char full_comm[SULOG_COMM_LEN];
+    char log_buf[SULOG_ENTRY_MAX_LEN];
+    struct sulog_entry *entry;
 
     if (!sulog_enabled)
         return;
 
-    timestamp = kmalloc(32, GFP_ATOMIC);
-    full_comm = kmalloc(SULOG_COMM_LEN, GFP_ATOMIC);
-    log_buf   = kmalloc(SULOG_ENTRY_MAX_LEN, GFP_ATOMIC);
+    get_timestamp(timestamp, sizeof(timestamp));
+    ksu_get_cmdline(full_comm, comm, sizeof(full_comm));
 
-    if (!timestamp || !full_comm || !log_buf) {
-        pr_err("sulog: failed to allocate memory for syscall log\n");
-        goto cleanup;
-    }
-
-    get_timestamp(timestamp, 32);
-    
-    ksu_get_cmdline(full_comm, comm, SULOG_COMM_LEN);
-
-    snprintf(log_buf, SULOG_ENTRY_MAX_LEN,
-         "[%s] SYSCALL: UID=%d COMM=%s SYSCALL=%s ARGS=%s PID=%d\n",
-         timestamp, uid, full_comm,
-         syscall  ? syscall  : "unknown",
-         args     ? args     : "none",
-         current->pid);
+    snprintf(log_buf, sizeof(log_buf),
+             "[%s] SYSCALL: UID=%d COMM=%s SYSCALL=%s ARGS=%s PID=%d\n",
+             timestamp, uid, full_comm, syscall ? syscall : "unknown",
+             args ? args : "none", current->pid);
 
     if (!dedup_should_print(uid, DEDUP_SYSCALL, log_buf, strlen(log_buf)))
-        goto cleanup;
+        return;
 
-    sulog_add_entry(log_buf);
-
-cleanup:
-    if (timestamp) kfree(timestamp);
-    if (full_comm) kfree(full_comm);
-    if (log_buf) kfree(log_buf);
+    entry = sulog_alloc_entry(log_buf);
+    if (entry)
+        sulog_add_entry(entry);
 }
 
 int ksu_sulog_init(void)
@@ -377,32 +334,34 @@ int ksu_sulog_init(void)
         pr_err("sulog: failed to create workqueue\n");
         return -ENOMEM;
     }
-    
+
     INIT_WORK(&sulog_work, sulog_work_handler);
-    
     pr_info("sulog: initialized successfully\n");
+
     return 0;
 }
 
 void ksu_sulog_exit(void)
 {
-    struct sulog_entry *entry, *tmp;
-    
+    struct sulog_entry *entry;
+    unsigned long flags;
+
     sulog_enabled = false;
-    
+
     if (sulog_workqueue) {
         flush_workqueue(sulog_workqueue);
         destroy_workqueue(sulog_workqueue);
         sulog_workqueue = NULL;
     }
-    
-    mutex_lock(&sulog_mutex);
-    list_for_each_entry_safe(entry, tmp, &sulog_queue, list) {
-        list_del(&entry->list);
-        kfree(entry);
+
+    spin_lock_irqsave(&fifo_lock, flags);
+    while (kfifo_out(&sulog_fifo, &entry, 1)) {
+        if (entry)
+            kfree(entry);
     }
-    mutex_unlock(&sulog_mutex);
-    
+    spin_unlock_irqrestore(&fifo_lock, flags);
+
     pr_info("sulog: cleaned up successfully\n");
 }
-#endif // __SULOG_GATE
+
+#endif

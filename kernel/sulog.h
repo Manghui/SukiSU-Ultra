@@ -16,6 +16,7 @@ extern struct timezone sys_tz;
 #define SULOG_COMM_LEN 256
 #define DEDUP_SECS     10
 
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
 #include <linux/rtc.h>
 
@@ -31,6 +32,12 @@ static inline void time64_to_tm(time64_t totalsecs, int offset, struct tm *resul
     result->tm_mon  = rtc_tm.tm_mon;
     result->tm_year = rtc_tm.tm_year;
 }
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
+#define ksu_strlcpy(dst, src, sz) strscpy(dst, src, sz)
+#else
+#define ksu_strlcpy(dst, src, sz) strlcpy(dst, src, sz)
 #endif
 
 struct dedup_key {
