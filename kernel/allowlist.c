@@ -261,6 +261,9 @@ out:
 
     if (persist)
         persistent_allow_list();
+#ifndef CONFIG_KSU_SUSFS
+
+#endif // #ifndef CONFIG_KSU_SUSFS
 
     return result;
 }

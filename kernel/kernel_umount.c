@@ -21,7 +21,11 @@
 
 #include "sulog.h"
 
+#ifndef CONFIG_KSU_SUSFS
 static bool ksu_kernel_umount_enabled = true;
+#else
+bool ksu_kernel_umount_enabled = true;
+#endif
 
 static int kernel_umount_feature_get(u64 *value)
 {
@@ -44,11 +48,25 @@ static const struct ksu_feature_handler kernel_umount_handler = {
     .set_handler = kernel_umount_feature_set,
 };
 
+#ifdef CONFIG_KSU_SUSFS
+extern bool susfs_is_mnt_devname_ksu(struct path *path);
+
+#if defined(CONFIG_KSU_SUSFS_TRY_UMOUNT) && defined(CONFIG_KSU_SUSFS_ENABLE_LOG)
+extern bool susfs_is_log_enabled;
+#endif // #if defined(CONFIG_KSU_SUSFS_TRY_UMOUNT) && defined(CONFIG_KSU_SUSFS_ENABLE_LOG)
+#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+extern void susfs_try_umount(void);
+#endif // #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+#endif // #ifdef CONFIG_KSU_SUSFS
+
 static bool should_umount(struct path *path)
 {
     if (!path) {
         return false;
     }
+#ifdef CONFIG_KSU_SUSFS
+    return susfs_is_mnt_devname_ksu(path);
+#else
 
     if (current->nsproxy->mnt_ns == init_nsproxy.mnt_ns) {
         pr_info("ignore global mnt namespace process: %d\n", current_uid().val);
@@ -60,6 +78,7 @@ static bool should_umount(struct path *path)
         return strcmp(fstype, "overlay") == 0;
     }
     return false;
+#endif // #ifdef CONFIG_KSU_SUSFS
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0) || defined(KSU_HAS_PATH_UMOUNT)
@@ -97,7 +116,11 @@ static int ksu_sys_umount(const char *mnt, int flags)
     })
 
 #endif
+#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
 void try_umount(const char *mnt, bool check_mnt, int flags)
+#else
+static void try_umount(const char *mnt, bool check_mnt, int flags)
+#endif // #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
 {
     struct path path;
     int ret;
@@ -118,6 +141,12 @@ void try_umount(const char *mnt, bool check_mnt, int flags)
         return;
     }
 
+#if defined(CONFIG_KSU_SUSFS_TRY_UMOUNT) && defined(CONFIG_KSU_SUSFS_ENABLE_LOG)
+    if (susfs_is_log_enabled) {
+        pr_info("susfs: umounting '%s'\n", mnt);
+    }
+#endif // #if defined(CONFIG_KSU_SUSFS_TRY_UMOUNT) && defined(CONFIG_KSU_SUSFS_ENABLE_LOG)
+
     ret = ksu_umount_mnt(mnt, &path, flags);
     if (ret) {
 #ifdef CONFIG_KSU_DEBUG
@@ -126,6 +155,20 @@ void try_umount(const char *mnt, bool check_mnt, int flags)
     }
 }
 
+#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+void susfs_try_umount_all(void) {
+    susfs_try_umount();
+    try_umount("/odm", true, 0);
+    try_umount("/system", true, 0);
+    try_umount("/vendor", true, 0);
+    try_umount("/product", true, 0);
+    try_umount("/system_ext", true, 0);
+    try_umount("/data/adb/modules", false, MNT_DETACH);
+    try_umount("/debug_ramdisk", true, MNT_DETACH);
+}
+#endif // #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+
+#ifndef CONFIG_KSU_SUSFS
 struct umount_tw {
     struct callback_head cb;
     const struct cred *old_cred;
@@ -147,15 +190,8 @@ static void umount_tw_func(struct callback_head *cb)
     try_umount("/product", true, 0);
     try_umount("/system_ext", true, 0);
     try_umount("/data/adb/modules", false, MNT_DETACH);
-    try_umount("/data/adb/kpm", false, MNT_DETACH);
     // try umount ksu temp path
     try_umount("/debug_ramdisk", false, MNT_DETACH);
-    try_umount("/sbin", false, MNT_DETACH);
-
-    try_umount("/system/etc/hosts", false, MNT_DETACH);
-    // try umount lsposed dex2oat bins
-    try_umount("/apex/com.android.art/bin/dex2oat64", false, MNT_DETACH);
-    try_umount("/apex/com.android.art/bin/dex2oat32", false, MNT_DETACH);
 
     if (saved)
         revert_creds(saved);
@@ -224,6 +260,7 @@ int ksu_handle_umount(uid_t old_uid, uid_t new_uid)
 
     return 0;
 }
+#endif // #ifndef CONFIG_KSU_SUSFS
 
 void ksu_kernel_umount_init(void)
 {

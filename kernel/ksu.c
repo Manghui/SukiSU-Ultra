@@ -7,11 +7,17 @@
 #include <generated/compile.h>
 #include <linux/version.h> /* LINUX_VERSION_CODE, KERNEL_VERSION macros */
 
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs.h>
+#endif
+
 #include "allowlist.h"
 #include "feature.h"
 #include "klog.h" // IWYU pragma: keep
 #include "throne_tracker.h"
+#ifndef CONFIG_KSU_SUSFS
 #include "syscall_hook_manager.h"
+#endif
 #include "ksud.h"
 #include "supercalls.h"
 
@@ -40,6 +46,8 @@ void sukisu_custom_config_exit(void)
 #endif
 }
 
+extern void ksu_lsm_hook_init(void);
+
 int __init kernelsu_init(void)
 {
 	pr_info("Initialized on: %s (%s) with driver version: %u\n",
@@ -57,11 +65,15 @@ int __init kernelsu_init(void)
 
     ksu_feature_init();
 
+    ksu_lsm_hook_init();
+
     ksu_supercalls_init();
 
     sukisu_custom_config_init();
 
+#if defined(CONFIG_KPROBES) && !defined(CONFIG_KSU_SUSFS)
     ksu_syscall_hook_manager_init();
+#endif
 
     ksu_workqueue = alloc_ordered_workqueue("kernelsu_work_queue", 0);
 
@@ -69,7 +81,13 @@ int __init kernelsu_init(void)
 
     ksu_throne_tracker_init();
 
+#ifdef CONFIG_KSU_SUSFS
+    susfs_init();
+#endif
+
+#if defined(CONFIG_KPROBES) && !defined(CONFIG_KSU_SUSFS)
     ksu_ksud_init();
+#endif
 
 #ifdef MODULE
 #ifndef CONFIG_KSU_DEBUG
@@ -90,9 +108,11 @@ void kernelsu_exit(void)
 
     destroy_workqueue(ksu_workqueue);
 
+#if defined(CONFIG_KPROBES) && !defined(CONFIG_KSU_SUSFS)
     ksu_ksud_exit();
 
     ksu_syscall_hook_manager_exit();
+#endif
 
     sukisu_custom_config_exit();
 

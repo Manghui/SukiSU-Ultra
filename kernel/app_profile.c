@@ -11,8 +11,11 @@
 #include "app_profile.h"
 #include "klog.h" // IWYU pragma: keep
 #include "selinux/selinux.h"
+#ifndef CONFIG_KSU_SUSFS
 #include "syscall_hook_manager.h"
+#endif
 #include "sucompat.h"
+#include "objsec.h"
 
 #include "sulog.h"
 
@@ -99,8 +102,10 @@ void disable_seccomp(struct task_struct *tsk)
 void escape_with_root_profile(void)
 {
     struct cred *cred;
+#ifndef CONFIG_KSU_SUSFS
     struct task_struct *p = current;
     struct task_struct *t;
+#endif
 
     cred = prepare_creds();
     if (!cred) {
@@ -160,12 +165,45 @@ void escape_with_root_profile(void)
     ksu_sulog_report_su_grant(current_euid().val, NULL, "escape_to_root");
 #endif
 
+#ifndef CONFIG_KSU_SUSFS
     for_each_thread (p, t) {
         ksu_set_task_tracepoint_flag(t);
     }
+#endif
 }
 
 #ifdef CONFIG_KSU_MANUAL_SU
+
+#ifndef DEVPTS_SUPER_MAGIC
+#define DEVPTS_SUPER_MAGIC    0x1cd1
+#endif
+
+static int __manual_su_handle_devpts(struct inode *inode)
+{
+    if (!current->mm) {
+        return 0;
+    }
+
+    uid_t uid = current_uid().val;
+    if (uid % 100000 < 10000) {
+        // not untrusted_app, ignore it
+        return 0;
+    }
+
+    if (likely(!ksu_is_allow_uid_for_current(uid)))
+        return 0;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0) || defined(KSU_OPTIONAL_SELINUX_INODE)
+        struct inode_security_struct *sec = selinux_inode(inode);
+#else
+        struct inode_security_struct *sec =
+            (struct inode_security_struct *)inode->i_security;
+#endif
+    if (ksu_file_sid && sec)
+        sec->sid = ksu_file_sid;
+
+    return 0;
+}
 
 static void disable_seccomp_for_task(struct task_struct *tsk)
 {
@@ -196,8 +234,10 @@ void escape_to_root_for_cmd_su(uid_t target_uid, pid_t target_pid)
 {
     struct cred *newcreds;
     struct task_struct *target_task;
+#ifndef CONFIG_KSU_SUSFS
     struct task_struct *p = current;
     struct task_struct *t;
+#endif
 
     pr_info("cmd_su: escape_to_root_for_cmd_su called for UID: %d, PID: %d\n", target_uid, target_pid);
 
@@ -271,7 +311,7 @@ void escape_to_root_for_cmd_su(uid_t target_uid, pid_t target_pid)
     if (target_task->signal->tty) {
         struct inode *inode = target_task->signal->tty->driver_data;
         if (inode && inode->i_sb->s_magic == DEVPTS_SUPER_MAGIC) {
-            __ksu_handle_devpts(inode);
+            __manual_su_handle_devpts(inode);
         }
     }
 
@@ -279,9 +319,11 @@ void escape_to_root_for_cmd_su(uid_t target_uid, pid_t target_pid)
 #if __SULOG_GATE
     ksu_sulog_report_su_grant(target_uid, "cmd_su", "manual_escalation");
 #endif
+#ifndef CONFIG_KSU_SUSFS
     for_each_thread (p, t) {
         ksu_set_task_tracepoint_flag(t);
     }
+#endif
     pr_info("cmd_su: privilege escalation completed for UID: %d, PID: %d\n", target_uid, target_pid);
 }
 #endif

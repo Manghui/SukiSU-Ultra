@@ -208,9 +208,6 @@ static inline bool check_syscall_fastpath(int nr)
     case __NR_faccessat:
     case __NR_execve:
     case __NR_setresuid:
-    case __NR_faccessat2:
-    case __NR_clone:
-    case __NR_clone3:
         return true;
     default:
         return false;
@@ -234,38 +231,6 @@ int ksu_handle_init_mark_tracker(const char __user **filename_user,
     }
 
     return 0;
-}
-
-#include "ksud.h"
-#ifdef CONFIG_KSU_MANUAL_SU
-#include "manual_su.h"
-#endif
-
-#ifndef LOOKUP_FOLLOW
-#define LOOKUP_FOLLOW 0x0001
-#endif
-
-static inline void ksu_handle_inode_permission(struct pt_regs *regs)
-{
-    struct inode *inode = NULL;
-    struct path path;
-    int dfd = (int)PT_REGS_PARM1(regs);
-    const char __user *filename = (const char __user *)PT_REGS_PARM2(regs);
-
-    if (!user_path_at(dfd, filename, LOOKUP_FOLLOW, &path)) {
-        inode = path.dentry->d_inode;
-        if (inode && inode->i_sb &&
-            unlikely(inode->i_sb->s_magic == DEVPTS_SUPER_MAGIC))
-            __ksu_handle_devpts(inode);
-        path_put(&path);
-    }
-}
-
-static inline void ksu_handle_task_alloc(struct pt_regs *regs)
-{
-#ifdef CONFIG_KSU_MANUAL_SU
-    ksu_try_escalate_for_uid(current_uid().val);
-#endif
 }
 
 #ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
@@ -317,16 +282,6 @@ static void ksu_sys_enter_handler(void *data, struct pt_regs *regs, long id)
 			ksu_handle_setresuid(ruid, euid, suid);
 			return;
 		}
-
-		// Handle inode_permission via faccessat
-		if (id == __NR_faccessat || id == __NR_faccessat2)
-        	return ksu_handle_inode_permission(regs);
-
-#ifdef CONFIG_KSU_MANUAL_SU
-		// Handle task_alloc via clone/fork
-    	if (id == __NR_clone || id == __NR_clone3)
-        	return ksu_handle_task_alloc(regs);
-#endif
 	}
 }
 #endif

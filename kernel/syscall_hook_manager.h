@@ -11,12 +11,6 @@
 #include "selinux/selinux.h"
 #include "objsec.h"
 
-#ifndef DEVPTS_SUPER_MAGIC
-#define DEVPTS_SUPER_MAGIC    0x1cd1
-#endif
-
-extern int __ksu_handle_devpts(struct inode *inode); // sucompat.c
-
 // Hook manager initialization and cleanup
 void ksu_syscall_hook_manager_init(void);
 void ksu_syscall_hook_manager_exit(void);
@@ -29,7 +23,6 @@ void ksu_mark_running_process(void);
 // Per-task mark operations
 int ksu_get_task_mark(pid_t pid);
 int ksu_set_task_mark(pid_t pid, bool mark);
-
 
 static inline void ksu_set_task_tracepoint_flag(struct task_struct *t)
 {
