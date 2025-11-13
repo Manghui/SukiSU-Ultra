@@ -174,6 +174,8 @@ void escape_with_root_profile(void)
 
 #ifdef CONFIG_KSU_MANUAL_SU
 
+#include "ksud.h"
+
 #ifndef DEVPTS_SUPER_MAGIC
 #define DEVPTS_SUPER_MAGIC    0x1cd1
 #endif

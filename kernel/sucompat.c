@@ -260,21 +260,6 @@ int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
     return 0;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-int ksu_handle_stat(int *dfd, struct filename **filename, int *flags) {
-    if (unlikely(IS_ERR(*filename) || (*filename)->name == NULL)) {
-        return 0;
-    }
-
-    if (likely(memcmp((*filename)->name, su_path, sizeof(su_path)))) {
-        return 0;
-    }
-
-    pr_info("ksu_handle_stat: su->sh!\n");
-    memcpy((void *)((*filename)->name), sh_path, sizeof(sh_path));
-    return 0;
-}
-#else
 int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 {
     if (unlikely(!filename_user)) {
@@ -309,7 +294,6 @@ int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 
     return 0;
 }
-#endif // #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
  
 int ksu_handle_devpts(struct inode *inode)
 {

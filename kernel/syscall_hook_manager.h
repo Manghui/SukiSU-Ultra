@@ -9,7 +9,6 @@
 #include <linux/tty.h>
 #include <linux/fs.h>
 #include "selinux/selinux.h"
-#include "objsec.h"
 
 // Hook manager initialization and cleanup
 void ksu_syscall_hook_manager_init(void);
