@@ -433,12 +433,8 @@ void persistent_allow_list(void)
 	}
 	cb->func = do_persistent_allow_list;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 8)
-	task_work_add(tsk, cb, false);
-#else
 	task_work_add(tsk, cb, true);
-#endif
-
+	
 put_task:
 	put_task_struct(tsk);
 }
