@@ -419,8 +419,8 @@ void persistent_allow_list()
         goto put_task;
     }
     cb->func = do_persistent_allow_list;
-    task_work_add(tsk, cb, TWA_RESUME);
-
+    // task_work_add(tsk, cb, TWA_RESUME); DEBUG PATCH
+    task_work_add(tsk, cb, true);
 put_task:
     put_task_struct(tsk);
 }
