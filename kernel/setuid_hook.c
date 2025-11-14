@@ -90,7 +90,7 @@ int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid)
             if (!is_ksu_domain()) {
                 pr_warn("find suspicious EoP: %d %s, from %d to %d\n", 
                     current->pid, current->comm, old_uid, new_uid);
-                force_sig(SIGKILL);
+                force_sig(SIGKILL, current);
                 return 0;
             }
         }
@@ -99,7 +99,7 @@ int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid)
             if (euid < current_euid().val && !ksu_is_allow_uid_for_current(old_uid)) {
                 pr_warn("find suspicious EoP: %d %s, from %d to %d\n", 
                     current->pid, current->comm, old_uid, new_uid);
-                force_sig(SIGKILL);
+                force_sig(SIGKILL, current);
                 return 0;
             }
         }
